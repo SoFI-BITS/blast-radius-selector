@@ -1091,6 +1091,9 @@ def main():
         elif unknown and nums:
             files = {file_of[x] for x in nums}
             nums.update(x for x in unknown if file_of[x] in files)
+        # PROBE BUILD (branch probe-noheavy): never run a test longer than 5 s, to measure
+        # on the practice board how many commits actually need the heavy tests.
+        nums = {x for x in nums if dur_of[x] <= 5000}
         ws = schedule([(dur_of[x], x) for x in nums])
         log("  ->", len(nums), "tests")
         out.append(json.dumps({"commit": cid, "workers": ws}, separators=(",", ":")))
