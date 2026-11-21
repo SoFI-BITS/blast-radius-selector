@@ -79,13 +79,16 @@ def _h(*parts):
     return h.hexdigest()
 
 
-def components(path):
+def components(path, only=None):
     from sqlglot import parse_one, serde, transpile
     from sqlglot.optimizer import optimize
     from tests.helpers import TPCDS_SCHEMA
 
-    for meta, sql in pairs(path):
+    for qi, (meta, sql) in enumerate(pairs(path)):
         ex = bool(meta.get("execute"))
+        if only is not None and qi not in only:
+            yield None, sql
+            continue
         try:
             e = pickle.loads(pickle.dumps(parse_one(sql)))
             parts = [json.dumps(serde.dump(e), sort_keys=True, default=str)]
@@ -164,10 +167,13 @@ def main():
     base = json.load(open(sys.argv[2]))
     ov = json.load(sys.stdin)
     sys.meta_path.insert(0, _Override(ov["sources"], ov["files"]))
+    only = set(ov["only"]) if ov.get("only") is not None else None
     queue = []
     n = 0
-    for (comp, sql), b in zip(components(path), base):
+    for (comp, sql), b in zip(components(path, only), base):
         n += 1
+        if comp is None:
+            continue  # this query runs none of the changed lines
         if comp["pre"] == b["pre"] and comp["tr"] == b["tr"]:
             continue
         if comp["tr"] != b["tr"] or comp["pre"].startswith("ERR"):

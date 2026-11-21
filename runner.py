@@ -107,6 +107,58 @@ def swap(files):
     return swapped
 
 
+class _Override:
+    """Serve patched source for the changed modules on a fresh import."""
+
+    def __init__(self, files):
+        self.by_mod = {}
+        for rel, src in files.items():
+            m = rel[:-3].replace("/", ".")
+            pkg = m.endswith(".__init__")
+            if pkg:
+                m = m[: -len(".__init__")]
+            self.by_mod[m] = (os.path.join(SRC, rel), src, pkg)
+
+    def find_spec(self, fullname, path, target=None):
+        import importlib.util
+
+        hit = self.by_mod.get(fullname)
+        if hit is None:
+            return None
+        spec = importlib.util.spec_from_loader(fullname, self, is_package=hit[2])
+        spec.origin = hit[0]
+        spec.has_location = True
+        if hit[2]:
+            spec.submodule_search_locations = [os.path.dirname(hit[0])]
+        return spec
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        path, src, _ = self.by_mod[module.__name__]
+        module.__file__ = path
+        exec(compile(src, path, "exec"), module.__dict__)
+
+
+def reimport(files):
+    """Forget every sqlglot/tests module and import them again from the patched sources
+    (third-party modules stay loaded)."""
+    for name in list(sys.modules):
+        if name == "sqlglot" or name.startswith("sqlglot.") or name == "tests" or name.startswith("tests."):
+            del sys.modules[name]
+    sys.meta_path.insert(0, _Override(files))
+    importlib.invalidate_caches()
+    import sqlglot  # noqa: F401
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name != "sqlglot.__main__":
+            try:
+                importlib.import_module(info.name)
+            except Exception:  # noqa
+                pass
+
+
 def run_tests(nodeids):
     failed = []
     done_setup = {}
@@ -151,7 +203,10 @@ def child(job, wfd):
     signal.signal(signal.SIGALRM, on_alarm)
     signal.setitimer(signal.ITIMER_REAL, job.get("timeout", CHILD_TIMEOUT))
     try:
-        swap(job["files"])
+        if job.get("mode") == "reimport":
+            reimport(job["files"])
+        else:
+            swap(job["files"])
         out = {"failed": run_tests(job["tests"])}
         if _timed_out[0]:
             out = {"error": "timeout"}  # a hang: keep the static selection

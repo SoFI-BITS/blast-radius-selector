@@ -89,6 +89,11 @@ class Map:
                 "argv": [os.path.join(APP, "gate", "genmem_proxy.py")], "always": True})
         except Exception:
             pass
+        self.tpcds_qcov = None
+        try:
+            self.tpcds_qcov = json.load(open(os.path.join(here, "tpcds_qcov.json")))["lines"]
+        except Exception:
+            pass
         # most expensive test first: a later check only runs if dropping its test still pays
         order = {"max_nodes": 0, "tpcds": 1, "generator_memory": 2}
         self.gates.sort(key=lambda g: order.get(g["name"], 9))
@@ -991,11 +996,24 @@ class Analyzer:
                 if any(g["lines"].get(rel) and not g["lines"][rel].isdisjoint(lines) for rel, lines in self.touched.items()):
                     log("  gate", g["name"], ": touches lines only the real test runs")
                     continue
-            if payload is None:
-                payload = json.dumps({
-                    "sources": {k: v[1] for k, v in self.overrides.items()},
-                    "files": {k: v[0] for k, v in self.overrides.items()},
-                })
+            req = {
+                "sources": {k: v[1] for k, v in self.overrides.items()},
+                "files": {k: v[0] for k, v in self.overrides.items()},
+            }
+            if g["name"] == "tpcds" and self.m.tpcds_qcov is not None and not self.static_names:
+                # function-body edits: only queries that run a changed line can change
+                mask = 0
+                for rel, lines in self.touched.items():
+                    d = self.m.tpcds_qcov.get(rel)
+                    if d:
+                        for ln in lines:
+                            mask |= d.get(str(ln), 0)
+                req["only"] = [i for i in range(mask.bit_length()) if (mask >> i) & 1]
+                log("  gate tpcds: queries to check", len(req["only"]))
+                if not req["only"]:
+                    bits &= ~(1 << t)
+                    continue
+            payload = json.dumps(req)
             try:
                 import subprocess
 
@@ -1129,6 +1147,10 @@ def main():
         return (max(sum(dur_of[x] for x in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
 
     an.cost_of = cost_of
+
+    def cost_of_nums(nums):
+        ws = schedule([(dur_of[x], x) for x in nums])
+        return (max(sum(dur_of[x] for x in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
     cdir = os.path.join(DATA, "commits")
     test_id_of = {t["number"]: t["id"] for t in t_json}
     num_of_id = {t["id"]: t["number"] for t in t_json}
@@ -1164,15 +1186,21 @@ def main():
             files = {file_of[x] for x in nums}
             nums.update(x for x in unknown if file_of[x] in files)
         run = set()
+        mode = None
         try:
-            if RUN_TESTS and an.swap_ok and nums:
-                run = {x for x in nums if dur_of[x] <= RUN_MAX_TEST_MS and not file_of[x].startswith(RUN_SKIP_FILES)}
-                if sum(dur_of[x] for x in run) > RUN_BUDGET_MS:
-                    run = set()
+            if RUN_TESTS and nums and an.overrides and an.proxy_ok:
+                mode = "swap" if an.swap_ok else "reimport"
+                overhead = 150 if mode == "swap" else 300
+                cand = {x for x in nums if dur_of[x] <= RUN_MAX_TEST_MS and not file_of[x].startswith(RUN_SKIP_FILES)}
+                spend = 1.2 * sum(dur_of[x] for x in cand) + overhead
+                gain = cost_of_nums(nums) - cost_of_nums(nums - cand)
+                # run when it pays even if only ~60% of such checks find nothing failing
+                if cand and (spend < 0.8 * gain or os.environ.get("BR_FORCE_RUN") == "1"):
+                    run = cand
         except Exception:
             run = set()
         if run:
-            jobs.append({"id": cid,
+            jobs.append({"id": cid, "mode": mode,
                          "files": {os.path.relpath(v[0], SRC).replace(os.sep, "/"): v[1] for v in an.overrides.values()},
                          "tests": sorted(test_id_of[x] for x in run),
                          "timeout": max(3.0, 4 * sum(dur_of[x] for x in run) / 1000 + 1)})
