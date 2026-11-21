@@ -97,6 +97,14 @@ class Map:
             self.tpcds_executed = {i for i, b in enumerate(base) if b.get("execute")}
         except Exception:
             self.tpcds_exec_qcov = None
+        self.cases = {}
+        self.cases_by_test = {}
+        try:
+            self.cases = json.load(open(os.path.join(here, "cases.json")))
+            for key in self.cases:
+                self.cases_by_test.setdefault(key.split("|")[0], []).append(key)
+        except Exception:
+            self.cases = {}
         self.attr_reads = {}
         try:
             self.attr_reads = json.load(open(os.path.join(here, "attr_reads.json")))
@@ -112,6 +120,20 @@ class Map:
         self.gates.sort(key=lambda g: order.get(g["name"], 9))
         for g in self.gates:
             g["min_saving"] = {"max_nodes": 1500, "tpcds": 7000, "generator_memory": 2500}.get(g["name"], 2000)
+
+    def cases_for(self, key, touched):
+        """Case numbers of a check_file (test, file) that run one of the touched lines."""
+        d = self.cases.get(key, {}).get("lines", {})
+        mask = 0
+        for rel, lines in touched.items():
+            fl = d.get(rel)
+            if fl:
+                for ln in lines:
+                    mask |= fl.get(str(ln), 0)
+        return {i for i in range(mask.bit_length()) if (mask >> i) & 1}
+
+    def case_total_ms(self, keys):
+        return sum(sum(self.cases[k]["ms"].values()) for k in keys)
 
     def bits(self, r):
         if r is None or r < 0:
@@ -1384,23 +1406,44 @@ def main():
             nums.update(x for x in unknown if file_of[x] in files)
         run = set()
         mode = None
+        run_cases = {}
         try:
             if RUN_TESTS and nums and an.overrides and an.proxy_ok and not an.side_edits:
                 mode = "swap" if an.swap_ok else "reimport"
                 overhead = 150 if mode == "swap" else 300
-                cand = {x for x in nums if dur_of[x] <= RUN_MAX_TEST_MS and not file_of[x].startswith(RUN_SKIP_FILES)}
-                spend = 1.2 * sum(dur_of[x] for x in cand) + overhead
+                est = {}
+                case_sel = {}
+                for x in nums:
+                    if file_of[x].startswith(RUN_SKIP_FILES):
+                        continue
+                    keys = mp.cases_by_test.get(test_id_of[x].rsplit("::", 1)[-1]) if \
+                        test_id_of[x].startswith("tests/test_optimizer.py::") else None
+                    if keys and mode == "swap":
+                        # check_file test: only the fixture cases that run a touched line
+                        ms = 40.0
+                        for key in keys:
+                            sel = mp.cases_for(key, an.touched)
+                            case_sel[key] = sel
+                            ms += sum(mp.cases[key]["ms"].get(str(c), 5.0) for c in sel)
+                        est[x] = ms + max(0.0, dur_of[x] - mp.case_total_ms(keys)) * 0.0
+                    else:
+                        est[x] = dur_of[x]
+                cand = {x for x in est if est[x] <= RUN_MAX_TEST_MS}
+                spend = 1.2 * sum(est[x] for x in cand) + overhead
                 gain = cost_of_nums(nums) - cost_of_nums(nums - cand)
                 # run when it pays even if only ~60% of such checks find nothing failing
                 if cand and (spend < 0.8 * gain or os.environ.get("BR_FORCE_RUN") == "1"):
                     run = cand
                     expected_net[0] += 0.8 * gain - spend
+                    run_cases = {k: v for k, v in case_sel.items()
+                                 if any(test_id_of[x].rsplit("::", 1)[-1] == k.split("|")[0] for x in run)}
         except Exception:
             run = set()
         if run:
             jobs.append({"id": cid, "mode": mode,
                          "files": {os.path.relpath(v[0], SRC).replace(os.sep, "/"): v[1] for v in an.overrides.values()},
                          "tests": sorted(test_id_of[x] for x in run),
+                         "cases": {k: sorted(v) for k, v in run_cases.items()},
                          "timeout": max(3.0, 4 * sum(dur_of[x] for x in run) / 1000 + 1)})
             log("  runtime check of", len(run), "tests")
         decided.append((cid, nums, run))

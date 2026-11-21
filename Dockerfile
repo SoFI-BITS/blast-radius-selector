@@ -17,7 +17,7 @@ RUN cd /app/src && PYTHONHASHSEED=0 PYTHONPATH=/app/src python -S /app/gate/tpcd
  && python -c "import json;b=json.load(open('/app/gate/baseline.json'));assert len(b)==99 and not any(x.get('res','').startswith('ERR') for x in b)"
 # the scaled test_max_nodes must pass on the unpatched code
 RUN cd /app/src && PYTHONPATH=/app/src python -S /app/gate/maxnodes_proxy.py --plain | grep -qx SAME  && PYTHONPATH=/app/src python -S /app/gate/genmem_proxy.py --plain | grep -qx SAME
-COPY selector.py runner.py /app/
+COPY selector.py runner.py pairs_exec.py /app/
 RUN chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "-S", "-E", "/app/selector.py"]

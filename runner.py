@@ -207,6 +207,14 @@ def child(job, wfd):
             reimport(job["files"])
         else:
             swap(job["files"])
+        if job.get("cases"):
+            # check_file tests: re-check only the fixture cases that reach the change
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import pairs_exec
+            import tests.test_optimizer as to
+
+            allowed = {tuple(k.split("|", 1)): set(v) for k, v in job["cases"].items()}
+            pairs_exec.install(to, allowed)
         out = {"failed": run_tests(job["tests"])}
         if _timed_out[0]:
             out = {"error": "timeout"}  # a hang: keep the static selection
