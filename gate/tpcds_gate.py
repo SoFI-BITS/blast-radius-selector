@@ -55,9 +55,17 @@ class _Override(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         exec(compile(self.sources[module.__name__], module.__file__, "exec"), module.__dict__)
 
 
+_FIXTURE_TEXT = [None]
+
+
 def pairs(path):
-    with open(path, encoding="utf-8") as f:
-        text = "\n".join(line for line in f.read().splitlines() if line and not line.startswith("--"))
+    if _FIXTURE_TEXT[0] is not None:
+        raw = _FIXTURE_TEXT[0]
+    else:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    if True:
+        text = "\n".join(line for line in raw.splitlines() if line and not line.startswith("--"))
     statements = text.split(";")
     for i in range(0, len(statements), 2):
         if i + 1 < len(statements):
@@ -167,6 +175,8 @@ def main():
     base = json.load(open(sys.argv[2]))
     ov = json.load(sys.stdin)
     sys.meta_path.insert(0, _Override(ov["sources"], ov["files"]))
+    if ov.get("fixture") is not None:
+        _FIXTURE_TEXT[0] = ov["fixture"]  # patched tpc-ds.sql: the test reads its queries from it
     only = set(ov["only"]) if ov.get("only") is not None else None
     queue = []
     n = 0

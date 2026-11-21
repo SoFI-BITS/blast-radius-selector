@@ -89,6 +89,11 @@ class Map:
                 "argv": [os.path.join(APP, "gate", "genmem_proxy.py")], "always": True})
         except Exception:
             pass
+        self.attr_reads = {}
+        try:
+            self.attr_reads = json.load(open(os.path.join(here, "attr_reads.json")))
+        except Exception:
+            pass
         self.tpcds_qcov = None
         try:
             self.tpcds_qcov = json.load(open(os.path.join(here, "tpcds_qcov.json")))["lines"]
@@ -449,6 +454,22 @@ def stored_names(s):
             elif isinstance(n, ast.Name):
                 out.add(n.id)
     return out
+
+
+def _fixture_pairs(text):
+    """tests/helpers.py load_sql_fixture_pairs, on a string (raises where it raises)."""
+    statements = "\n".join(line for line in text.splitlines() if line and not line.startswith("--")).split(";")
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql = statements[i].strip()
+            lines = sql.split("\n")
+            meta = {}
+            j = 0
+            while lines[j].startswith("#"):
+                key, val = lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            yield meta, "\n".join(lines[j:]), statements[i + 1].strip()
 
 
 def mod_name(rel):
@@ -946,14 +967,110 @@ class Analyzer:
             b = m.opened_bits(p)
             if new_file or deleted or rename:
                 b |= m.under_dir(p.rsplit("/", 1)[0]) if "/" in p else 0
+            elif fp["hunks"] and p.endswith(".sql") and p.startswith("tests/fixtures/"):
+                b = self.refine_sql_fixture(p, fp, b)
             log("  data file", p, bin(b).count("1"))
             bits |= b
         return bits
+
+    # ------------------------------------------------------------ fixtures
+    def refine_sql_fixture(self, p, fp, b):
+        """Fixture read in a class's setUpClass: only the tests that use the attribute it is
+        stored in can see the change, as long as the class setup still succeeds."""
+        m = self.m
+        old = self.read_src(p)
+        if old is None:
+            return b
+        res = apply_hunks(old, fp["hunks"])
+        if res is None:
+            return b
+        new = res[0]
+        self.fixture_edits[p] = new
+        changed = [t for tag, t in (x for h in fp["hunks"] for x in h[4]) if tag in "+-"]
+        if changed and all(t.startswith("--") for t in changed):
+            log("  fixture: only '--' comment lines changed (the loaders drop them)")
+            return 0
+        try:
+            list(_fixture_pairs(new))  # what setUpClass does: must still load
+        except Exception:
+            log("  fixture no longer loads: whole consumer classes kept")
+            return b
+        by_class = {}
+        for i, nid in enumerate(m.tests):
+            if (b >> i) & 1:
+                parts = nid.split("::")
+                if len(parts) == 3:
+                    by_class.setdefault((parts[0], parts[1]), []).append(i)
+        out = b
+        for (tfile, cname), idxs in by_class.items():
+            all_idx = [i for i, nid in enumerate(m.tests) if nid.startswith(f"{tfile}::{cname}::")]
+            if len(idxs) != len(all_idx) or len(all_idx) < 3:
+                continue  # not a class-wide (setUpClass) consumer
+            users = self.class_attr_users(tfile, cname, p)
+            if users is None:
+                continue
+            keep = 0
+            for i in all_idx:
+                if m.tests[i].split("::")[2] in users:
+                    keep |= 1 << i
+            cls_bits = 0
+            for i in all_idx:
+                cls_bits |= 1 << i
+            log("  fixture via", cname, "setUpClass: users", sorted(users))
+            out = (out & ~cls_bits) | keep
+        return out
+
+    def class_attr_users(self, tfile, cname, p):
+        src = self.read_src(tfile)
+        if src is None:
+            return None
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return None
+        cls = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cname), None)
+        if cls is None:
+            return None
+        methods = {n.name: n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        setup = methods.get("setUpClass")
+        if setup is None:
+            return None
+        rel = p[len("tests/fixtures/"):]
+        attrs = set()
+        for n in ast.walk(setup):
+            if isinstance(n, ast.Assign):
+                consts = [c.value for c in ast.walk(n.value) if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+                if any(c and (rel == c or rel.endswith("/" + c) or c.endswith(rel)) for c in consts):
+                    for t_ in n.targets:
+                        if isinstance(t_, ast.Attribute):
+                            attrs.add(t_.attr)
+        if not attrs:
+            return None  # the file reaches the class some other way: keep all
+        measured = self.m.attr_reads.get(f"{tfile}::{cname}")
+        if measured is not None:
+            # measured on the pinned commit: which tests read each setUpClass attribute
+            return {t for a_ in attrs for t in measured.get(a_, ())}
+
+        def refs(fn):
+            a = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+            return a
+
+        direct = {name for name, fn in methods.items() if refs(fn) & attrs and name != "setUpClass"}
+        users = set(direct)
+        changed = True
+        while changed:  # tests calling helpers that use the attribute
+            changed = False
+            for name, fn in methods.items():
+                if name not in users and refs(fn) & users:
+                    users.add(name)
+                    changed = True
+        return {u for u in users if u.startswith("test")}
 
     def commit(self, text):
         self.gate_ok = True
         self.proxy_ok = True
         self.header_change = False
+        self.fixture_edits = {}
         self.touched = {}
         self.overrides = {}
         self.static_names = set()
@@ -969,6 +1086,15 @@ class Analyzer:
 
     def apply_gate(self, bits):
         """Drop an expensive selected test when a faithful check proves it unaffected."""
+        tpcds_fixture = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+        if not self.overrides and set(self.fixture_edits) == {tpcds_fixture} and self.only_fixture_edits:
+            g = next((x for x in self.m.gates if x["name"] == "tpcds"), None)
+            if g is not None and g["bit"] is not None and (bits >> g["bit"]) & 1:
+                verdict = self.run_gate(g, {"sources": {}, "files": {}, "fixture": self.fixture_edits[tpcds_fixture]})
+                log("  gate tpcds (fixture edit) verdict", verdict[:100])
+                if verdict == "SAME":
+                    bits &= ~(1 << g["bit"])
+            return bits
         if not self.overrides:
             return bits
         payload = None
@@ -1031,8 +1157,24 @@ class Analyzer:
                 bits &= ~(1 << t)
         return bits
 
+    def run_gate(self, g, req):
+        import subprocess
+
+        env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0",
+               "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp")}
+        try:
+            r = subprocess.run([sys.executable, "-S"] + g["argv"], input=json.dumps(req), capture_output=True,
+                               text=True, env=env, timeout=90, cwd=SRC)
+            out = r.stdout.strip().splitlines()
+            return out[-1] if out else "ERR"
+        except Exception as e:
+            return "ERR " + repr(e)
+
     def _commit(self, text):
         files = parse_patch(text)
+        self.only_fixture_edits = all(
+            (f.get("old") or "").startswith("tests/fixtures/") and f.get("old") == f.get("new")
+            and not (f["deleted"] or f["new_file"] or f["rename"] or f["binary"]) for f in files) if files else False
         if not files:
             log("  no files parsed")
             return 0 if not text.strip() else self.m.ALL
@@ -1156,6 +1298,7 @@ def main():
     num_of_id = {t["id"]: t["number"] for t in t_json}
     decided = []
     jobs = []
+    expected_net = [0.0]
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
@@ -1197,6 +1340,7 @@ def main():
                 # run when it pays even if only ~60% of such checks find nothing failing
                 if cand and (spend < 0.8 * gain or os.environ.get("BR_FORCE_RUN") == "1"):
                     run = cand
+                    expected_net[0] += 0.8 * gain - spend
         except Exception:
             run = set()
         if run:
@@ -1206,6 +1350,11 @@ def main():
                          "timeout": max(3.0, 4 * sum(dur_of[x] for x in run) / 1000 + 1)})
             log("  runtime check of", len(run), "tests")
         decided.append((cid, nums, run))
+    # one preload (~1.5 s CPU) serves the whole batch: only worth it if the batch gains more
+    if jobs and expected_net[0] < 2500 and os.environ.get("BR_FORCE_RUN") != "1":
+        log("runner skipped: expected net gain", round(expected_net[0]))
+        jobs = []
+        decided = [(c, n, set()) for c, n, _ in decided]
     results = run_jobs(jobs) if jobs else {}
     out = []
     for cid, nums, run in decided:

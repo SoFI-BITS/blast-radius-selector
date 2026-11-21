@@ -1,0 +1,80 @@
+{
+"tests/test_executor.py::TestExecutor": {
+"tpcds_tables": [
+"test_execute_tpcds"
+],
+"tpcds_sqls": [
+"test_execute_tpcds"
+],
+"tpcds_conn": [
+"test_execute_tpcds",
+"test_typed_division_of_null_is_null"
+],
+"cache": [
+"test_execute_tpcds",
+"test_optimized_tpch"
+],
+"tpch_tables": [
+"test_execute_tpch"
+],
+"tpch_sqls": [
+"test_execute_tpch",
+"test_optimized_tpch"
+],
+"tpch_conn": [
+"test_optimized_tpch",
+"test_typed_division_of_null_is_null"
+]
+},
+"tests/test_optimizer.py::TestOptimizer": {
+"pool": [
+"test_canonicalize",
+"test_canonicalize_internal_names",
+"test_eliminate_ctes",
+"test_eliminate_joins",
+"test_eliminate_subqueries",
+"test_isolate_table_selects",
+"test_merge_subqueries",
+"test_normalize",
+"test_normalize_identifiers",
+"test_optimize",
+"test_optimize_joins",
+"test_pushdown_cte_alias_columns",
+"test_pushdown_predicates",
+"test_pushdown_projection",
+"test_qualify_columns",
+"test_qualify_columns__with_invisible",
+"test_qualify_tables",
+"test_quote_identifiers",
+"test_simplify",
+"test_tpcds",
+"test_tpch",
+"test_unnest_subqueries"
+],
+"conn": [
+"test_canonicalize_internal_names",
+"test_eliminate_joins",
+"test_merge_subqueries",
+"test_optimize",
+"test_optimize_distinct_on_predicates",
+"test_optimize_in_nulls",
+"test_optimize_joins",
+"test_optimize_snowflake_asof_without_on",
+"test_optimize_special_joins",
+"test_optimize_subqueries_in_aggregates",
+"test_optimize_subqueries_in_join_on",
+"test_optimize_uncorrelated_exists",
+"test_qualify_columns",
+"test_qualify_columns_using_after_outer_join",
+"test_simplify",
+"test_unnest_subqueries"
+]
+},
+"tests/test_sqlglotc.py::TestSQLGlotC": {
+"build_ext": [
+"test_build_removes_obsolete_extensions",
+"test_dry_run_preserves_obsolete_extensions",
+"test_editable_install_removes_obsolete_extensions"
+]
+}
+}

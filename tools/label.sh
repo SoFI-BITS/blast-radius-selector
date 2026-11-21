@@ -9,6 +9,6 @@ for p in /mut/commits/*.patch; do
   rm -rf /work && cp -r /src /work && cd /work
   if ! git apply "$p" 2>/tmp/err; then echo "{\"apply_failed\": true}" > "/mut/labels/$id.json"; continue; fi
   LABEL_OUT="/mut/labels/$id.json" PYTHONPATH=/work:/tools timeout 900 python -m pytest -p labelplugin \
-     -q -p no:cacheprovider -n 4 --timeout 300 tests >/tmp/log.txt 2>&1
+     -q -p no:cacheprovider -n 4 --timeout 300 ${LABEL_TESTS:-tests} >/tmp/log.txt 2>&1
   echo "$id $(tail -1 /tmp/log.txt)"
 done

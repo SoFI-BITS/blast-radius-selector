@@ -111,6 +111,8 @@ def fixture_mut(rel):
     return None
 
 
+if os.environ.get("MUT_FIXTURES"):
+    fixtures = os.environ["MUT_FIXTURES"].split(",")
 kinds = os.environ.get("MUT_KINDS", "code,code,code,code,code,code,comment,fixture,fixture,multi").split(",")
 n = 0
 while n < COUNT:
