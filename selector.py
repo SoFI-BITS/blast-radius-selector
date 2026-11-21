@@ -15,12 +15,18 @@ import zlib
 
 APP = os.path.dirname(os.path.abspath(__file__))
 DATA = os.environ.get("BR_DATA", "/data")
-SRC = os.environ.get("BR_SRC", os.path.join(APP, "src"))
+SRC = os.path.abspath(os.environ.get("BR_SRC", os.path.join(APP, "src")))
 MAP = os.environ.get("BR_MAP", os.path.join(APP, "map", "blast.map"))
 DEBUG = os.environ.get("BR_DEBUG") == "1"
+GATE = os.path.join(APP, "gate", "tpcds_gate.py")
+GATE_FIXTURE = os.path.abspath(os.environ.get("BR_GATE_FIXTURE", os.path.join(SRC, "tests", "fixtures", "optimizer", "tpc-ds")))
+GATE_BASELINE = os.path.abspath(os.environ.get("BR_GATE_BASELINE", os.path.join(APP, "gate", "baseline.json")))
+GATE_TEST_ID = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
 
 WORKER_MS = 2000
 MAX_WORKERS = 8
+
+_STDLIB_OK = set(getattr(sys, "stdlib_module_names", ())) | {"typing_extensions"}
 
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py", "setup.py"}
 
@@ -50,6 +56,16 @@ class Map:
         self.module_users_ = d["module_users"]
         self.test_file_bits = d["test_file_bits"]
         self.plain_enums = set(d.get("plain_enums", ()))
+        self.defs = d.get("defs", {})
+        self.top_names = d.get("top_names", {})
+        self.gate_test = self.tests.index(GATE_TEST_ID) if GATE_TEST_ID in self.tests else None
+        self.exec_phase = {}
+        try:
+            epj = json.load(open(os.path.join(os.path.dirname(path), "exec_phase.json")))
+            self.exec_phase = {f: set(v) for f, v in epj["tpcds"].items()}
+            self.exec_phase_names = set(epj["tpcds_names"])
+        except Exception:
+            self.gate_test = None  # no phase map: never gate
 
     def bits(self, r):
         if r is None or r < 0:
@@ -551,6 +567,7 @@ class Analyzer:
             new_tree = ast.parse(new)
         except SyntaxError:
             log("  syntax error ->module users", rel)
+            self.gate_ok = False
             return m.module_users(rel)
         cached = self._old_cache.get(rel)
         if cached is None:
@@ -562,6 +579,7 @@ class Analyzer:
             log("  AST unchanged", rel)
             return 0
         un = Units(new_tree)
+        self.overrides[mod_name(rel)] = (os.path.join(SRC, rel), new)
         bits = 0
         targets = set(ch_old)
         for p in ins:
@@ -569,22 +587,55 @@ class Analyzer:
             targets.add(p + 1)
         # Only consider lines whose statement actually differs: compare the
         # innermost statements of old and new by dump to skip comment lines.
+        new_simple = {}
+        for x in un.stmts:
+            if not isinstance(x, COMPOUND) and _overlaps(x, nrng):
+                new_simple.setdefault(ast.dump(x), []).append(x)
+        old_simple = {}
+        for x in u.stmts:
+            if not isinstance(x, COMPOUND) and _overlaps(x, orng):
+                old_simple.setdefault(ast.dump(x), []).append(x)
+        same_old = set()
+        for dmp, xs in old_simple.items():
+            if len(new_simple.get(dmp, ())) == len(xs):
+                same_old.update(id(x) for x in xs)
+        same_new = set()
+        for dmp, xs in new_simple.items():
+            if len(old_simple.get(dmp, ())) == len(xs):
+                same_new.update(id(x) for x in xs)
         for ln in sorted(targets):
+            st = u.innermost_stmt(ln)
+            if st is not None and id(st) in same_old and ln in ch_old:
+                continue  # statement text changed only in comments/whitespace
             b = self.unit_bits(rel, u, ln, is_insert_neighbor=(ln not in ch_old))
             bits |= b
         # Import-time effects seen from the new tree (e.g. an inserted
         # class attribute): analyse new statements in class/module scope.
+        new_lines = new.split("\n")
         for ln in sorted(ch_new):
+            txt = new_lines[ln - 1].strip() if 0 < ln <= len(new_lines) else ""
+            if not txt or txt.startswith("#"):
+                continue  # blank or comment-only added line
             s = un.innermost_stmt(ln)
-            if s is None:
+            if s is None or id(s) in same_new:
                 continue
+            if isinstance(s, ast.ClassDef) and not (header_range(s)[0] <= ln <= header_range(s)[1]):
+                continue  # inside the class body but between statements
             sc = un.scope_of(s)
             fn = un.enclosing_function(s)
-            if fn is None and not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and not un.lambda_at(ln, s):
+            if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(sc, ast.ClassDef)                     and header_range(s)[0] <= ln <= header_range(s)[1]                     and not self._old_has_method(rel, u, un.qualname(sc), s.name):
+                # a new or re-declared method may override a parent's method of that name
+                self.gate_ok = False
+                b = m.bits(m.defs.get(s.name, -1))
+                users = m.class_users(self.class_qual(rel, un, sc))
+                bits |= (b & users) if users else b
+                log("  method def", s.name, bin(b).count("1"), "users", bin(users).count("1"))
+            elif fn is None and not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and not un.lambda_at(ln, s):
                 bits |= self.static_effect(rel, un, s, sc)
         return bits
 
     def unknown_py(self, rel):
+        self.gate_ok = False
         return self.m.module_users(rel) if rel.startswith("sqlglot/") else self.tests_file_scope(rel)
 
     def tests_file_scope(self, rel):
@@ -602,6 +653,7 @@ class Analyzer:
         if lam is not None and fn is None:
             # lambda inside a class/module level statement: runtime part
             b = m.lines_bits(rel, all_lines(lam))
+            self.touched.setdefault(rel, set()).update(all_lines(lam))
             if not is_insert_neighbor and ln == lam.lineno:
                 b |= self.static_effect(rel, u, s, u.scope_of(s))
             return b
@@ -628,8 +680,10 @@ class Analyzer:
                 if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
                     lines.extend(body_lines(parent))
             b = m.lines_bits(rel, lines)
+            self.touched.setdefault(rel, set()).update(lines)
             if any(x in il for x in lines):
                 # runs at import time (factory / metaclass / decorator body)
+                self.gate_ok = False
                 b |= self.import_exec_effect(rel, u, s, fn)
             if is_insert_neighbor:
                 return b
@@ -641,6 +695,10 @@ class Analyzer:
             if lo <= ln <= hi:
                 if is_insert_neighbor:
                     return m.lines_bits(rel, [ln])
+                # signature/defaults: only callers see it, i.e. whoever runs the body
+                self.touched.setdefault(rel, set()).update(body_lines(s))
+                if s.decorator_list:
+                    self.gate_ok = False
                 b = m.lines_bits(rel, body_lines(s))
                 b |= self.static_effect(rel, u, s, sc) if any(d for d in s.decorator_list) else 0
                 return b
@@ -648,11 +706,41 @@ class Analyzer:
         if isinstance(s, ast.ClassDef):
             lo, hi = header_range(s)
             if lo <= ln <= hi and not is_insert_neighbor:
+                self.gate_ok = False
                 return self.class_scope_users(rel, u, s) | m.lines_bits(rel, all_lines(s))
             return 0
         if is_insert_neighbor:
             return 0
         return self.static_effect(rel, u, s, sc) | m.lines_bits(rel, all_lines(s))
+
+    def _old_has_method(self, rel, u, cls_qual, name):
+        for x in u.stmts:
+            if isinstance(x, ast.ClassDef) and u.qualname(x) == cls_qual:
+                return any(isinstance(y, (ast.FunctionDef, ast.AsyncFunctionDef)) and y.name == name for y in x.body)
+        return False
+
+    def import_resolves(self, rel, s):
+        """Every module/name the import statement needs exists in the pinned sources."""
+        tn = self.m.top_names
+        if isinstance(s, ast.Import):
+            return all(a.name in tn or not a.name.startswith("sqlglot") and a.name.split(".")[0] in _STDLIB_OK
+                       for a in s.names)
+        base = s.module or ""
+        if s.level:
+            pkg = mod_name(rel) if rel.endswith("__init__.py") else mod_name(rel).rpartition(".")[0]
+            parts = pkg.split(".")
+            if s.level > 1:
+                parts = parts[: len(parts) - (s.level - 1)]
+            base = ".".join(parts + ([s.module] if s.module else []))
+        if base not in tn:
+            return base.split(".")[0] in _STDLIB_OK and not base.startswith("sqlglot")
+        names = set(tn[base])
+        for a in s.names:
+            if a.name == "*":
+                return False
+            if a.name not in names and f"{base}.{a.name}" not in tn:
+                return False
+        return True
 
     def class_qual(self, rel, u, cls_node):
         return f"{mod_name(rel)}:{u.qualname(cls_node)}"
@@ -682,6 +770,15 @@ class Analyzer:
 
     def static_effect(self, rel, u, s, sc):
         """Import-time statement in class or module scope."""
+        if isinstance(s, (ast.Import, ast.ImportFrom)) or not rel.startswith("sqlglot/"):
+            self.gate_ok = False
+        else:
+            names = stored_names(s)
+            if not names:
+                self.gate_ok = False
+            else:
+                _, seen = self.m.readers(names)
+                self.static_names |= seen
         b = self._static_effect(rel, u, s, sc)
         if rel.startswith("sqlglot/") and self.m.module_users(rel) == self.m.ALL and not in_type_checking(u, s):
             # tests that import sqlglot in a fresh subprocess see import-time effects
@@ -693,6 +790,26 @@ class Analyzer:
         if in_type_checking(u, s):
             return 0
         if isinstance(s, (ast.Import, ast.ImportFrom)):
+            if rel.startswith("sqlglot/") and self.import_resolves(rel, s):
+                # an import only binds a module global: what changes is code in
+                # this module that references the bound names
+                names = {(a.asname or a.name).split(".")[0] for a in s.names}
+                tree = self._old_cache.get(rel, (None,))[0]
+                lines = set()
+                if tree is not None:
+                    for n in ast.walk(tree):
+                        if isinstance(n, ast.Name) and n.id in names and isinstance(n.ctx, ast.Load):
+                            lines.add(n.lineno)
+                        elif isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in names:
+                            lines.add(n.lineno)
+                rb = m.lines_bits(rel, lines)
+                # module-level uses run at import: their effects are the readers of what they bind
+                for st in tree.body if tree is not None else ():
+                    if not isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+                        if any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(st)):
+                            rb |= self._static_effect(rel, u, st, u.scope_of(st)) if u.scope_of(st) is not None else 0
+                log("  import (resolvable)", names, bin(rb).count("1"))
+                return rb
             return m.module_users(rel) if rel.startswith("sqlglot/") else self.tests_file_scope(rel)
         if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant):
             return 0  # docstring
@@ -713,7 +830,12 @@ class Analyzer:
                 users |= m.class_users(self.class_qual(rel, u, p))
                 p = u.scope_of(p)
             if users:
-                sel = rb & users
+                # direct readers first; the derived-name closure only when the
+                # attribute is never read directly by a user of the class
+                direct, _ = m.readers(names, depth=0)
+                sel = direct & users
+                if not sel:
+                    sel = rb & users
                 log("  class attr", names, "readers", bin(rb).count("1"), "users", bin(users).count("1"), "sel", bin(sel).count("1"))
                 return sel if sel else 0
             log("  class attr (no users)", names, bin(rb).count("1"))
@@ -727,6 +849,9 @@ class Analyzer:
     def file_change(self, fp):
         m = self.m
         old, new = fp.get("old"), fp.get("new")
+        if not (old and old == new and old.startswith("sqlglot/") and old.endswith(".py")
+                and not (fp["deleted"] or fp["new_file"] or fp["rename"] or fp["binary"])):
+            self.gate_ok = False
         bits = 0
         paths = [p for p in (old, new) if p]
         if not paths:
@@ -777,6 +902,50 @@ class Analyzer:
         return bits
 
     def commit(self, text):
+        self.gate_ok = True
+        self.touched = {}
+        self.overrides = {}
+        self.static_names = set()
+        bits = self._commit(text)
+        return self.apply_gate(bits)
+
+    def apply_gate(self, bits):
+        m = self.m
+        g = m.gate_test
+        if g is None or not (bits >> g) & 1 or not self.gate_ok or not self.overrides:
+            return bits
+        hit = self.static_names & m.exec_phase_names
+        if hit:
+            log("  gate: class/module names read while executing", sorted(hit)[:5])
+            return bits
+        for rel, lines in self.touched.items():
+            ex = m.exec_phase.get(rel)
+            if ex and not ex.isdisjoint(lines):
+                log("  gate: touches executor phase", rel)
+                return bits
+        if not os.path.exists(GATE_BASELINE):
+            return bits
+        payload = json.dumps({
+            "sources": {k: v[1] for k, v in self.overrides.items()},
+            "files": {k: v[0] for k, v in self.overrides.items()},
+        })
+        try:
+            import subprocess
+
+            env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", ""),
+                   "HOME": os.environ.get("HOME", "/tmp")}
+            r = subprocess.run([sys.executable, "-S", GATE, GATE_FIXTURE, GATE_BASELINE], input=payload,
+                               capture_output=True, text=True, env=env, timeout=90, cwd=SRC)
+            verdict = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "ERR"
+        except Exception as e:  # never drop the test on a gate problem
+            log("  gate error", repr(e))
+            return bits
+        log("  gate verdict", verdict, r.stderr[-400:] if verdict != "SAME" else "")
+        if verdict == "SAME":
+            return bits & ~(1 << g)
+        return bits
+
+    def _commit(self, text):
         files = parse_patch(text)
         if not files:
             log("  no files parsed")

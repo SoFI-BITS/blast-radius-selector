@@ -33,7 +33,18 @@ prebuilt map (`map/blast.map`, about 0.65 MB), then answers in well under a CPU 
 5. **Config files** (`pyproject.toml`, `setup.cfg`, `conftest.py`, and similar): the full suite.
    Anything the analysis cannot understand falls back to module users or the full suite,
    never to an empty selection.
-6. **Scheduling:** LPT over 1–8 workers with a move-improvement pass, picking the worker
+6. **TPC-DS executor gate** (`gate/tpcds_gate.py`). `test_execute_tpcds` takes 21 s and is often
+   reached by code that doesn't change its outcome. When it is selected, and the patch touches no line
+   or name used while planning or executing (`map/exec_phase.json`, recorded by
+   `tools/exec_phase.py`), the selector re-runs the test's pre-execution pipeline on the patched code:
+   - parse, then pickle-round-trip,
+   - `optimize(..., leave_tables_isolated=True)`,
+   - DuckDB transpile for the expected side.
+
+   It compares per-query fingerprints with a baseline that the Docker build computes. Queries
+   whose fingerprint changed (at most 12) are executed, and their result tables are compared with
+   the unpatched results. Only a full match drops the test.
+7. **Scheduling:** LPT over 1–8 workers with a move-improvement pass, picking the worker
    count with the lowest `makespan + 2 s × workers`. Times are integer milliseconds,
    the same as the scorer.
 

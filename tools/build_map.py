@@ -369,6 +369,45 @@ for rel in py_files:
             b |= test_file_bits.get(modules[imp], 0)
         module_users[rel] = b
 
+# ------------------------------------- method name -> tests running it
+# (a method added to a subclass can override any same-named method)
+defs_bits = defaultdict(int)
+top_names = {}  # module -> top-level names it defines (for import checks)
+for rel, src in sources.items():
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        continue
+    names = set()
+    for st in tree.body:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(st.name)
+        elif isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for t_ in (st.targets if isinstance(st, ast.Assign) else [st.target]):
+                for n in ast.walk(t_):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+        elif isinstance(st, (ast.Import, ast.ImportFrom)):
+            for a in st.names:
+                names.add((a.asname or a.name).split(".")[0])
+        elif isinstance(st, (ast.If, ast.Try)):
+            for n in ast.walk(st):
+                if isinstance(n, (ast.FunctionDef, ast.ClassDef)):
+                    names.add(n.name)
+                elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    names.add(n.id)
+                elif isinstance(n, ast.alias):
+                    names.add((n.asname or n.name).split(".")[0])
+    top_names[mod_of(rel)] = sorted(names)
+    if not rel.startswith("sqlglot/"):
+        continue
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            b = 0
+            for ln in range(node.body[0].lineno, (node.end_lineno or node.lineno) + 1):
+                b |= line_bits.get((rel, ln), 0)
+            defs_bits[node.name] |= b
+
 # ------------------------------------------------- plain (non-mixin) enums
 enum_bases = {}
 for rel, src in sources.items():
@@ -432,6 +471,8 @@ out = {
     "module_users": {f: ref(b) for f, b in module_users.items()},
     "test_file_bits": {f: ref(b) for f, b in test_file_bits.items()},
     "plain_enums": plain_enums,
+    "defs": {n: ref(b) for n, b in defs_bits.items()},
+    "top_names": top_names,
     "pool": [format(b, "x") for b in pool_list],
 }
 raw = json.dumps(out, separators=(",", ":")).encode()
