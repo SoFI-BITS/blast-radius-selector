@@ -1184,19 +1184,7 @@ class Analyzer:
                 if not req["only"]:
                     bits &= ~(1 << t)
                     continue
-            payload = json.dumps(req)
-            try:
-                import subprocess
-
-                env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0",
-                       "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp")}
-                r = subprocess.run([sys.executable, "-S"] + g["argv"], input=payload, capture_output=True,
-                                   text=True, env=env, timeout=90, cwd=SRC)
-                out = r.stdout.strip().splitlines()
-                verdict = out[-1] if out else "ERR"
-            except Exception as e:  # never drop a test on a gate problem
-                log("  gate error", g["name"], repr(e))
-                continue
+            verdict = self.run_gate(g, req)
             log("  gate", g["name"], "verdict", verdict[:120])
             if verdict == "SAME":
                 bits &= ~(1 << t)
@@ -1234,6 +1222,17 @@ class Analyzer:
         return bits & ~(1 << t) if verdict == "SAME" else bits
 
     def run_gate(self, g, req):
+        import resource
+        import subprocess
+
+        _r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        try:
+            return self._run_gate(g, req)
+        finally:
+            _r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+            CPU_LOG.append((g["name"], _r1.ru_utime + _r1.ru_stime - _r0.ru_utime - _r0.ru_stime))
+
+    def _run_gate(self, g, req):
         import subprocess
 
         env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0",
@@ -1319,14 +1318,28 @@ def schedule(items):
 dur_of = {}
 
 
-RUN_TESTS = os.environ.get("BR_RUN", "1") == "1"
+RUN_TESTS = os.environ.get("BR_RUN", "0") == "1"  # off: on practice it cost 5.6 s CPU for 0.2 s saved
 RUN_MAX_TEST_MS = 1500
 RUN_BUDGET_MS = 4000
 RUN_SKIP_FILES = ("tests/test_executor.py", "tests/test_sqlglotc.py", "tests/test_build.py")
 
 
+CPU_LOG = []
+
+
 def run_jobs(jobs):
+    import resource
     import subprocess
+
+    _r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    try:
+        return _run_jobs(jobs, subprocess)
+    finally:
+        _r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        CPU_LOG.append(("runner", _r1.ru_utime + _r1.ru_stime - _r0.ru_utime - _r0.ru_stime))
+
+
+def _run_jobs(jobs, subprocess):
 
     env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0", "BR_SRC": SRC,
            "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"), "SKIP_INTEGRATION": "0"}
@@ -1465,6 +1478,16 @@ def main():
                 log(cid, "runtime error, keeping static selection:", res.get("error"))
         ws = schedule([(dur_of[x], x) for x in nums])
         out.append(json.dumps({"commit": cid, "workers": ws}, separators=(",", ":")))
+    if DEBUG:
+        import collections
+        import resource
+
+        agg = collections.defaultdict(lambda: [0, 0.0])
+        for k, v in CPU_LOG:
+            agg[k][0] += 1
+            agg[k][1] += v
+        me = resource.getrusage(resource.RUSAGE_SELF)
+        log("CPU self", round(me.ru_utime + me.ru_stime, 2), {k: (n, round(c, 2)) for k, (n, c) in agg.items()})
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
 
