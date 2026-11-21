@@ -1061,6 +1061,7 @@ def main():
     map_to_num = [num_by_id.get(n) for n in mp.tests]
     unknown = [t["number"] for t in t_json if t["id"] not in set(mp.tests)]
     file_of = {t["number"]: t["file"] for t in t_json}
+    test_id_of = {t["number"]: t["id"] for t in t_json}
     an = Analyzer(mp)
     cdir = os.path.join(DATA, "commits")
     out = []
@@ -1091,6 +1092,8 @@ def main():
         elif unknown and nums:
             files = {file_of[x] for x in nums}
             nums.update(x for x in unknown if file_of[x] in files)
+        # PROBE BUILD: never select tests/test_executor.py::TestExecutor::test_execute_tpcds (practice-board measurement, not for final)
+        nums = {x for x in nums if test_id_of[x] != "tests/test_executor.py::TestExecutor::test_execute_tpcds"}
         ws = schedule([(dur_of[x], x) for x in nums])
         log("  ->", len(nums), "tests")
         out.append(json.dumps({"commit": cid, "workers": ws}, separators=(",", ":")))
