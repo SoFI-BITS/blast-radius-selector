@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.map binary
+*.gz binary
+*.patch -text
