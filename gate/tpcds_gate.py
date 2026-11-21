@@ -178,6 +178,9 @@ def main():
     if ov.get("fixture") is not None:
         _FIXTURE_TEXT[0] = ov["fixture"]  # patched tpc-ds.sql: the test reads its queries from it
     only = set(ov["only"]) if ov.get("only") is not None else None
+    if ov.get("full"):
+        print(full_replica(directory, path, base, only))
+        return
     queue = []
     n = 0
     for (comp, sql), b in zip(components(path, only), base):
@@ -192,7 +195,7 @@ def main():
         if not b["execute"]:
             continue  # only parsed and pickled by the test: no crash, no effect
         queue.append((sql, b["res"]))
-        if len(queue) > MAX_EXECUTE:
+        if len(queue) > ov.get("max_execute", MAX_EXECUTE):
             print("DIFF")
             return
     if n != len(base):
@@ -203,6 +206,39 @@ def main():
             print("DIFF")
             return
     print("SAME")
+
+
+def full_replica(directory, path, base, only=None):
+    """What test_execute_tpcds checks, on the patched code, for the queries that can be
+    affected (`only`; all when None): parse + pickle, and for executed queries the duckdb
+    side and the executor's result table versus the unpatched result."""
+    import pickle as _p
+
+    from sqlglot import parse_one, transpile
+
+    got = list(pairs(path))
+    if len(got) != len(base):
+        return "DIFF count"
+    for i, (meta, sql) in enumerate(got):
+        if only is not None and i not in only:
+            continue
+        b = base[i]
+        if bool(meta.get("execute")) != b["execute"]:
+            return "DIFF meta"
+        try:
+            _p.loads(_p.dumps(parse_one(sql)))
+        except BaseException:
+            return "DIFF parse"
+        if b["execute"]:
+            try:
+                tr = _h(transpile(sql, write="duckdb")[0])
+            except BaseException as err:
+                tr = "ERR" + _h(type(err).__name__, str(err))
+            if tr != b["tr"]:
+                return "DIFF tr"
+            if result_hash(directory, sql) != b["res"]:
+                return "DIFF res"
+    return "SAME"
 
 
 if __name__ == "__main__":

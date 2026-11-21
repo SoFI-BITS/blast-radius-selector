@@ -18,6 +18,8 @@ ROOT = os.getcwd().rstrip("/") + "/"
 phase = ["off"]
 lines = {"tpcds": set(), "tpch": set()}
 suite = ["tpcds"]
+qidx = [0]
+per_query = {}  # (file, line) -> bitmask of tpc-ds query indices (exec phase)
 _fc = {}
 
 
@@ -35,6 +37,8 @@ def on_line(code, ln):
     r = rel(code.co_filename)
     if r:
         lines[suite[0]].add((r, ln))
+        if suite[0] == "tpcds" and qidx[0] >= 0:
+            per_query[(r, ln)] = per_query.get((r, ln), 0) | (1 << qidx[0])
     return mon.DISABLE
 
 
@@ -55,6 +59,7 @@ class Sync:
         a = pickle.loads(pickle.dumps(a))
         prev = phase[0]
         phase[0] = "exec"
+        mon.restart_events()  # per-query sets: every query records its own lines
         try:
             r = fn(*a, **k)
             r = pickle.loads(pickle.dumps(r))
@@ -63,6 +68,7 @@ class Sync:
             f.set_exception(e)
         finally:
             phase[0] = prev
+            qidx[0] += 1
         return f
 
     def __enter__(self):
@@ -99,6 +105,7 @@ import tests.test_executor as te  # noqa: E402
 te.ProcessPoolExecutor = Sync
 
 # table loading in setUpClass builds executor Tables: exec phase for both suites
+qidx[0] = -1  # not attributed to a query: any change here means every query
 phase[0] = "exec"
 suite[0] = "tpcds"
 te.TestExecutor.setUpClass()
@@ -110,6 +117,7 @@ t = te.TestExecutor("test_execute_tpcds")
 t.subtestHelper = lambda *a, **k: None  # comparison is pandas-only
 for name, s in (("tpcds", "test_execute_tpcds"), ("tpch", "test_execute_tpch")):
     suite[0] = name
+    qidx[0] = 0
     mon.restart_events()
     getattr(te.TestExecutor(s), s).__func__(t)
 
@@ -120,4 +128,8 @@ for k, v in lines.items():
     for f in out[k]:
         out[k][f].sort()
 json.dump(out, open(sys.argv[1], "w"))
+pq = {}
+for (f, ln), mask in per_query.items():
+    pq.setdefault(f, {})[str(ln)] = mask
+json.dump({"queries": qidx[0], "lines": pq}, open(sys.argv[1].replace("exec_phase.json", "tpcds_exec_qcov.json"), "w"))
 print({k: len(v) for k, v in lines.items()}, file=sys.stderr)

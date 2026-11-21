@@ -89,6 +89,14 @@ class Map:
                 "argv": [os.path.join(APP, "gate", "genmem_proxy.py")], "always": True})
         except Exception:
             pass
+        self.tpcds_exec_qcov = None
+        self.tpcds_executed = set()
+        try:
+            self.tpcds_exec_qcov = json.load(open(os.path.join(here, "tpcds_exec_qcov.json")))["lines"]
+            base = json.load(open(GATE_BASELINE)) if os.path.exists(GATE_BASELINE) else []
+            self.tpcds_executed = {i for i, b in enumerate(base) if b.get("execute")}
+        except Exception:
+            self.tpcds_exec_qcov = None
         self.attr_reads = {}
         try:
             self.attr_reads = json.load(open(os.path.join(here, "attr_reads.json")))
@@ -918,8 +926,14 @@ class Analyzer:
     def file_change(self, fp):
         m = self.m
         old, new = fp.get("old"), fp.get("new")
-        if not (old and old == new and old.startswith("sqlglot/") and old.endswith(".py")
-                and not (fp["deleted"] or fp["new_file"] or fp["rename"] or fp["binary"])):
+        plain = old and old == new and not (fp["deleted"] or fp["new_file"] or fp["rename"] or fp["binary"])
+        if plain and (old.startswith("tests/fixtures/") or (
+                old.startswith("tests/") and old.endswith(".py")
+                and old not in ("tests/helpers.py", "tests/__init__.py") and not old.endswith("conftest.py"))):
+            # an edit to a fixture or test file beside the code change: it only blocks the
+            # checks of tests that read that file (see apply_gate)
+            self.side_edits.add(old)
+        elif not (plain and old.startswith("sqlglot/") and old.endswith(".py")):
             self.gate_ok = False
             self.proxy_ok = False
         bits = 0
@@ -1071,6 +1085,7 @@ class Analyzer:
         self.proxy_ok = True
         self.header_change = False
         self.fixture_edits = {}
+        self.side_edits = set()
         self.touched = {}
         self.overrides = {}
         self.static_names = set()
@@ -1082,7 +1097,7 @@ class Analyzer:
         """Every edit is inside bodies of functions that never run at import time:
         swapping their __code__ in a preloaded process reproduces the patch exactly."""
         return bool(self.overrides) and self.gate_ok and self.proxy_ok and not self.header_change \
-            and not self.static_names
+            and not self.static_names and not self.side_edits
 
     def apply_gate(self, bits):
         """Drop an expensive selected test when a faithful check proves it unaffected."""
@@ -1101,6 +1116,12 @@ class Analyzer:
         for g in self.m.gates:
             t = g["bit"]
             if t is None or not (bits >> t) & 1:
+                continue
+            tid_ = self.m.tests[t]
+            if self.side_edits and g["name"] != "tpcds":
+                continue  # side-edit commits: only the 21 s TPC-DS check is worth its CPU
+            if any(((self.m.opened_bits(p) >> t) & 1) or tid_.startswith(p + "::") for p in self.side_edits):
+                log("  gate", g["name"], ": a side edit is read by the real test")
                 continue
             if self.cost_of is not None:
                 saving = self.cost_of(bits) - self.cost_of(bits & ~(1 << t))
@@ -1121,6 +1142,8 @@ class Analyzer:
                     continue
                 if any(g["lines"].get(rel) and not g["lines"][rel].isdisjoint(lines) for rel, lines in self.touched.items()):
                     log("  gate", g["name"], ": touches lines only the real test runs")
+                    if g["name"] == "tpcds":
+                        bits = self.tpcds_partial_replica(g, bits)
                     continue
             req = {
                 "sources": {k: v[1] for k, v in self.overrides.items()},
@@ -1156,6 +1179,37 @@ class Analyzer:
             if verdict == "SAME":
                 bits &= ~(1 << t)
         return bits
+
+    def tpcds_partial_replica(self, g, bits):
+        """Executor-phase lines touched: run the exact test logic on the patched code, but
+        only for the queries that run a touched line (parse/optimize or execution)."""
+        m = self.m
+        if m.tpcds_qcov is None or m.tpcds_exec_qcov is None or self.cost_of is None:
+            return bits
+        t = g["bit"]
+        saving = self.cost_of(bits) - self.cost_of(bits & ~(1 << t))
+        mask = 0
+        for rel, lines in self.touched.items():
+            pre = m.tpcds_qcov.get(rel, {})
+            exe = m.tpcds_exec_qcov.get(rel, {})
+            ex_phase = g["lines"].get(rel, set())
+            for ln in lines:
+                mask |= pre.get(str(ln), 0) | exe.get(str(ln), 0)
+                if ln in ex_phase and str(ln) not in exe:
+                    mask = (1 << 99) - 1  # table loading / shared setup: every query
+        only = [i for i in range(mask.bit_length()) if (mask >> i) & 1]
+        executed = sum(1 for i in only if i in m.tpcds_executed)
+        est = 1500 + 350 * executed + 20 * len(only)
+        log("  gate tpcds partial replica:", len(only), "queries,", executed, "executed, est", est, "ms, saving", saving)
+        if not only:
+            return bits & ~(1 << t)
+        if est > 0.6 * saving:
+            return bits
+        verdict = self.run_gate(g, {"sources": {k: v[1] for k, v in self.overrides.items()},
+                                    "files": {k: v[0] for k, v in self.overrides.items()},
+                                    "full": True, "only": only})
+        log("  gate tpcds partial replica verdict", verdict[:60])
+        return bits & ~(1 << t) if verdict == "SAME" else bits
 
     def run_gate(self, g, req):
         import subprocess
@@ -1331,7 +1385,7 @@ def main():
         run = set()
         mode = None
         try:
-            if RUN_TESTS and nums and an.overrides and an.proxy_ok:
+            if RUN_TESTS and nums and an.overrides and an.proxy_ok and not an.side_edits:
                 mode = "swap" if an.swap_ok else "reimport"
                 overhead = 150 if mode == "swap" else 300
                 cand = {x for x in nums if dur_of[x] <= RUN_MAX_TEST_MS and not file_of[x].startswith(RUN_SKIP_FILES)}
