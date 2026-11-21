@@ -20,6 +20,8 @@ for dp, dn, fn in os.walk(os.path.join(SRC, "sqlglot")):
         if f.endswith(".py"):
             py.append(os.path.relpath(os.path.join(dp, f), SRC).replace(os.sep, "/"))
 py.sort()
+if os.environ.get("MUT_FILES"):
+    py = [x for x in py if any(x.startswith(pre) for pre in os.environ["MUT_FILES"].split(","))]
 fixtures = sorted(
     os.path.relpath(os.path.join(dp, f), SRC).replace(os.sep, "/")
     for dp, dn, fn in os.walk(os.path.join(SRC, "tests", "fixtures", "optimizer"))
@@ -109,7 +111,7 @@ def fixture_mut(rel):
     return None
 
 
-kinds = ["code"] * 6 + ["comment"] * 1 + ["fixture"] * 2 + ["multi"] * 1
+kinds = os.environ.get("MUT_KINDS", "code,code,code,code,code,code,comment,fixture,fixture,multi").split(",")
 n = 0
 while n < COUNT:
     k = rnd.choice(kinds)

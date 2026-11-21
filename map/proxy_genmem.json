@@ -1,0 +1,1 @@
+{"only_full": {"sqlglot/dialects/dialect.py": [228, 249, 250, 252, 253, 254, 256, 257]}, "only_full_names": ["Dialect", "__name__", "_classes", "dir", "getattr", "hash", "isinstance", "issubclass", "lower", "type"], "real": 132, "proxy": 12465}

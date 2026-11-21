@@ -58,14 +58,39 @@ class Map:
         self.plain_enums = set(d.get("plain_enums", ()))
         self.defs = d.get("defs", {})
         self.top_names = d.get("top_names", {})
-        self.gate_test = self.tests.index(GATE_TEST_ID) if GATE_TEST_ID in self.tests else None
-        self.exec_phase = {}
+        self.gates = []
+        here = os.path.dirname(path)
+
+        def tid(x):
+            return self.tests.index(x) if x in self.tests else None
+
         try:
-            epj = json.load(open(os.path.join(os.path.dirname(path), "exec_phase.json")))
-            self.exec_phase = {f: set(v) for f, v in epj["tpcds"].items()}
-            self.exec_phase_names = set(epj["tpcds_names"])
+            epj = json.load(open(os.path.join(here, "exec_phase.json")))
+            if os.path.exists(GATE_BASELINE):
+                self.gates.append({
+                    "name": "tpcds", "bit": tid(GATE_TEST_ID),
+                    "lines": {f: set(v) for f, v in epj["tpcds"].items()}, "names": set(epj["tpcds_names"]),
+                    "argv": [GATE, GATE_FIXTURE, GATE_BASELINE]})
         except Exception:
-            self.gate_test = None  # no phase map: never gate
+            pass
+        try:
+            pj = json.load(open(os.path.join(here, "proxy_maxnodes.json")))
+            self.gates.append({
+                "name": "max_nodes", "bit": tid("tests/test_parser.py::TestParser::test_max_nodes"),
+                "lines": {f: set(v) for f, v in pj["only_full"].items()}, "names": set(pj["only_full_names"]),
+                "argv": [os.path.join(APP, "gate", "maxnodes_proxy.py")]})
+        except Exception:
+            pass
+        try:
+            pj = json.load(open(os.path.join(here, "proxy_genmem.json")))
+            self.gates.append({
+                "name": "generator_memory", "bit": tid("tests/test_generator.py::TestGenerator::test_generator_memory"),
+                "lines": {f: set(v) for f, v in pj["only_full"].items()}, "names": set(pj["only_full_names"]),
+                "argv": [os.path.join(APP, "gate", "genmem_proxy.py")]})
+        except Exception:
+            pass
+        # cheapest check first
+        self.gates.sort(key=lambda g: g["name"] == "tpcds")
 
     def bits(self, r):
         if r is None or r < 0:
@@ -552,6 +577,17 @@ class Analyzer:
             return None
 
     def py_change(self, rel, fp):
+        """A change in module M can only reach tests that import M or run its code."""
+        bits = self._py_change(rel, fp)
+        if rel.startswith("sqlglot/"):
+            m = self.m
+            mask = m.module_users(rel) | m.under_dir(rel.rsplit("/", 1)[0]) | m.opened_bits("<subprocess>")
+            if bits & ~mask:
+                log("  masked to module users", bin(bits).count("1"), "->", bin(bits & mask).count("1"))
+            bits &= mask
+        return bits
+
+    def _py_change(self, rel, fp):
         """Bits for a modification of an existing .py file."""
         m = self.m
         old = self.read_src(rel)
@@ -910,39 +946,41 @@ class Analyzer:
         return self.apply_gate(bits)
 
     def apply_gate(self, bits):
-        m = self.m
-        g = m.gate_test
-        if g is None or not (bits >> g) & 1 or not self.gate_ok or not self.overrides:
+        """Drop an expensive selected test when a faithful check proves it unaffected."""
+        if not self.gate_ok or not self.overrides:
             return bits
-        hit = self.static_names & m.exec_phase_names
-        if hit:
-            log("  gate: class/module names read while executing", sorted(hit)[:5])
-            return bits
-        for rel, lines in self.touched.items():
-            ex = m.exec_phase.get(rel)
-            if ex and not ex.isdisjoint(lines):
-                log("  gate: touches executor phase", rel)
-                return bits
-        if not os.path.exists(GATE_BASELINE):
-            return bits
-        payload = json.dumps({
-            "sources": {k: v[1] for k, v in self.overrides.items()},
-            "files": {k: v[0] for k, v in self.overrides.items()},
-        })
-        try:
-            import subprocess
+        payload = None
+        for g in self.m.gates:
+            t = g["bit"]
+            if t is None or not (bits >> t) & 1:
+                continue
+            hit = self.static_names & g["names"]
+            if hit:
+                log("  gate", g["name"], ": names read only by the real test", sorted(hit)[:5])
+                continue
+            if any(g["lines"].get(rel) and not g["lines"][rel].isdisjoint(lines) for rel, lines in self.touched.items()):
+                log("  gate", g["name"], ": touches lines only the real test runs")
+                continue
+            if payload is None:
+                payload = json.dumps({
+                    "sources": {k: v[1] for k, v in self.overrides.items()},
+                    "files": {k: v[0] for k, v in self.overrides.items()},
+                })
+            try:
+                import subprocess
 
-            env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0", "PATH": os.environ.get("PATH", ""),
-                   "HOME": os.environ.get("HOME", "/tmp")}
-            r = subprocess.run([sys.executable, "-S", GATE, GATE_FIXTURE, GATE_BASELINE], input=payload,
-                               capture_output=True, text=True, env=env, timeout=90, cwd=SRC)
-            verdict = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "ERR"
-        except Exception as e:  # never drop the test on a gate problem
-            log("  gate error", repr(e))
-            return bits
-        log("  gate verdict", verdict, r.stderr[-400:] if verdict != "SAME" else "")
-        if verdict == "SAME":
-            return bits & ~(1 << g)
+                env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0",
+                       "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp")}
+                r = subprocess.run([sys.executable, "-S"] + g["argv"], input=payload, capture_output=True,
+                                   text=True, env=env, timeout=90, cwd=SRC)
+                out = r.stdout.strip().splitlines()
+                verdict = out[-1] if out else "ERR"
+            except Exception as e:  # never drop a test on a gate problem
+                log("  gate error", g["name"], repr(e))
+                continue
+            log("  gate", g["name"], "verdict", verdict[:120])
+            if verdict == "SAME":
+                bits &= ~(1 << t)
         return bits
 
     def _commit(self, text):
