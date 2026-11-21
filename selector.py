@@ -78,7 +78,7 @@ class Map:
             self.gates.append({
                 "name": "max_nodes", "bit": tid("tests/test_parser.py::TestParser::test_max_nodes"),
                 "lines": {f: set(v) for f, v in pj["only_full"].items()}, "names": set(pj["only_full_names"]),
-                "argv": [os.path.join(APP, "gate", "maxnodes_proxy.py")]})
+                "argv": [os.path.join(APP, "gate", "maxnodes_proxy.py")], "always": True})
         except Exception:
             pass
         try:
@@ -86,11 +86,14 @@ class Map:
             self.gates.append({
                 "name": "generator_memory", "bit": tid("tests/test_generator.py::TestGenerator::test_generator_memory"),
                 "lines": {f: set(v) for f, v in pj["only_full"].items()}, "names": set(pj["only_full_names"]),
-                "argv": [os.path.join(APP, "gate", "genmem_proxy.py")]})
+                "argv": [os.path.join(APP, "gate", "genmem_proxy.py")], "always": True})
         except Exception:
             pass
-        # cheapest check first
-        self.gates.sort(key=lambda g: g["name"] == "tpcds")
+        # most expensive test first: a later check only runs if dropping its test still pays
+        order = {"max_nodes": 0, "tpcds": 1, "generator_memory": 2}
+        self.gates.sort(key=lambda g: order.get(g["name"], 9))
+        for g in self.gates:
+            g["min_saving"] = {"max_nodes": 1500, "tpcds": 7000, "generator_memory": 2500}.get(g["name"], 2000)
 
     def bits(self, r):
         if r is None or r < 0:
@@ -567,6 +570,7 @@ class Analyzer:
     def __init__(self, mp):
         self.m = mp
         self._old_cache = {}
+        self.cost_of = None  # bits -> scheduled cost in ms, set by main()
 
     def read_src(self, rel):
         p = os.path.join(SRC, rel)
@@ -604,6 +608,7 @@ class Analyzer:
         except SyntaxError:
             log("  syntax error ->module users", rel)
             self.gate_ok = False
+            self.proxy_ok = False
             return m.module_users(rel)
         cached = self._old_cache.get(rel)
         if cached is None:
@@ -672,6 +677,7 @@ class Analyzer:
 
     def unknown_py(self, rel):
         self.gate_ok = False
+        self.proxy_ok = False
         return self.m.module_users(rel) if rel.startswith("sqlglot/") else self.tests_file_scope(rel)
 
     def tests_file_scope(self, rel):
@@ -888,6 +894,7 @@ class Analyzer:
         if not (old and old == new and old.startswith("sqlglot/") and old.endswith(".py")
                 and not (fp["deleted"] or fp["new_file"] or fp["rename"] or fp["binary"])):
             self.gate_ok = False
+            self.proxy_ok = False
         bits = 0
         paths = [p for p in (old, new) if p]
         if not paths:
@@ -939,6 +946,7 @@ class Analyzer:
 
     def commit(self, text):
         self.gate_ok = True
+        self.proxy_ok = True
         self.touched = {}
         self.overrides = {}
         self.static_names = set()
@@ -947,20 +955,33 @@ class Analyzer:
 
     def apply_gate(self, bits):
         """Drop an expensive selected test when a faithful check proves it unaffected."""
-        if not self.gate_ok or not self.overrides:
+        if not self.overrides:
             return bits
         payload = None
         for g in self.m.gates:
             t = g["bit"]
             if t is None or not (bits >> t) & 1:
                 continue
-            hit = self.static_names & g["names"]
-            if hit:
-                log("  gate", g["name"], ": names read only by the real test", sorted(hit)[:5])
+            if self.cost_of is not None:
+                saving = self.cost_of(bits) - self.cost_of(bits & ~(1 << t))
+                if saving < g.get("min_saving", 1500):
+                    log("  gate", g["name"], ": dropping it would save only", saving, "ms")
+                    continue
+            if g.get("always"):
+                # scaled replica of the real test, run on the patched code: trusted for
+                # any patch made only of edits to existing, parseable sqlglot modules
+                if not self.proxy_ok:
+                    continue
+            elif not self.gate_ok:
                 continue
-            if any(g["lines"].get(rel) and not g["lines"][rel].isdisjoint(lines) for rel, lines in self.touched.items()):
-                log("  gate", g["name"], ": touches lines only the real test runs")
-                continue
+            else:
+                hit = self.static_names & g["names"]
+                if hit:
+                    log("  gate", g["name"], ": names read only by the real test", sorted(hit)[:5])
+                    continue
+                if any(g["lines"].get(rel) and not g["lines"][rel].isdisjoint(lines) for rel, lines in self.touched.items()):
+                    log("  gate", g["name"], ": touches lines only the real test runs")
+                    continue
             if payload is None:
                 payload = json.dumps({
                     "sources": {k: v[1] for k, v in self.overrides.items()},
@@ -995,6 +1016,7 @@ class Analyzer:
                 bits |= self.file_change(fp)
             except Exception as e:  # never let a parse problem become an empty selection
                 log("  error", repr(e))
+                self.gate_ok = self.proxy_ok = False
                 p = fp.get("new") or fp.get("old") or ""
                 bits |= self.m.module_users(p) if p.startswith("sqlglot/") and p.endswith(".py") else self.m.ALL
         return bits
@@ -1062,6 +1084,20 @@ def main():
     unknown = [t["number"] for t in t_json if t["id"] not in set(mp.tests)]
     file_of = {t["number"]: t["file"] for t in t_json}
     an = Analyzer(mp)
+
+    def cost_of(bits):
+        nums = []
+        i = 0
+        b = bits
+        while b:
+            if b & 1 and map_to_num[i] is not None:
+                nums.append(map_to_num[i])
+            b >>= 1
+            i += 1
+        ws = schedule([(dur_of[x], x) for x in nums])
+        return (max(sum(dur_of[x] for x in w) for w in ws) + WORKER_MS * len(ws)) if ws else 0
+
+    an.cost_of = cost_of
     cdir = os.path.join(DATA, "commits")
     out = []
     for name in sorted(os.listdir(cdir)):
