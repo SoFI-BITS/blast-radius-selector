@@ -738,6 +738,7 @@ class Analyzer:
                 if is_insert_neighbor:
                     return m.lines_bits(rel, [ln])
                 # signature/defaults: only callers see it, i.e. whoever runs the body
+                self.header_change = True
                 self.touched.setdefault(rel, set()).update(body_lines(s))
                 if s.decorator_list:
                     self.gate_ok = False
@@ -947,11 +948,19 @@ class Analyzer:
     def commit(self, text):
         self.gate_ok = True
         self.proxy_ok = True
+        self.header_change = False
         self.touched = {}
         self.overrides = {}
         self.static_names = set()
         bits = self._commit(text)
         return self.apply_gate(bits)
+
+    @property
+    def swap_ok(self):
+        """Every edit is inside bodies of functions that never run at import time:
+        swapping their __code__ in a preloaded process reproduces the patch exactly."""
+        return bool(self.overrides) and self.gate_ok and self.proxy_ok and not self.header_change \
+            and not self.static_names
 
     def apply_gate(self, bits):
         """Drop an expensive selected test when a faithful check proves it unaffected."""
@@ -1074,6 +1083,28 @@ def schedule(items):
 dur_of = {}
 
 
+RUN_TESTS = os.environ.get("BR_RUN", "1") == "1"
+RUN_MAX_TEST_MS = 1500
+RUN_BUDGET_MS = 4000
+RUN_SKIP_FILES = ("tests/test_executor.py", "tests/test_sqlglotc.py", "tests/test_build.py")
+
+
+def run_jobs(jobs):
+    import subprocess
+
+    env = {"PYTHONPATH": SRC, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONHASHSEED": "0", "BR_SRC": SRC,
+           "PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"), "SKIP_INTEGRATION": "0"}
+    try:
+        r = subprocess.run([sys.executable, os.path.join(APP, "runner.py")], input=json.dumps({"jobs": jobs}),
+                           capture_output=True, text=True, env=env, timeout=150, cwd=SRC)
+        if DEBUG and r.stderr:
+            log("runner stderr:", r.stderr[-800:])
+        return json.loads(r.stdout) if r.stdout.strip() else {}
+    except Exception as e:  # any failure: keep every static selection
+        log("runner failed", repr(e))
+        return {}
+
+
 def main():
     t_json = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     for t in t_json:
@@ -1099,7 +1130,10 @@ def main():
 
     an.cost_of = cost_of
     cdir = os.path.join(DATA, "commits")
-    out = []
+    test_id_of = {t["number"]: t["id"] for t in t_json}
+    num_of_id = {t["id"]: t["number"] for t in t_json}
+    decided = []
+    jobs = []
     for name in sorted(os.listdir(cdir)):
         if not name.endswith(".patch"):
             continue
@@ -1112,6 +1146,8 @@ def main():
         except Exception as e:
             log("commit failed", cid, repr(e))
             bits = mp.ALL
+            an.overrides = {}
+            an.gate_ok = False
         nums = set()
         b = bits
         i = 0
@@ -1127,8 +1163,33 @@ def main():
         elif unknown and nums:
             files = {file_of[x] for x in nums}
             nums.update(x for x in unknown if file_of[x] in files)
+        run = set()
+        try:
+            if RUN_TESTS and an.swap_ok and nums:
+                run = {x for x in nums if dur_of[x] <= RUN_MAX_TEST_MS and not file_of[x].startswith(RUN_SKIP_FILES)}
+                if sum(dur_of[x] for x in run) > RUN_BUDGET_MS:
+                    run = set()
+        except Exception:
+            run = set()
+        if run:
+            jobs.append({"id": cid,
+                         "files": {os.path.relpath(v[0], SRC).replace(os.sep, "/"): v[1] for v in an.overrides.values()},
+                         "tests": sorted(test_id_of[x] for x in run),
+                         "timeout": max(3.0, 4 * sum(dur_of[x] for x in run) / 1000 + 1)})
+            log("  runtime check of", len(run), "tests")
+        decided.append((cid, nums, run))
+    results = run_jobs(jobs) if jobs else {}
+    out = []
+    for cid, nums, run in decided:
+        if run:
+            res = results.get(cid) or {"error": "no result"}
+            if "failed" in res:
+                failed = {num_of_id[n] for n in res["failed"] if n in num_of_id}
+                nums = (nums - run) | failed
+                log(cid, "runtime:", len(run), "run,", len(failed), "failed")
+            else:
+                log(cid, "runtime error, keeping static selection:", res.get("error"))
         ws = schedule([(dur_of[x], x) for x in nums])
-        log("  ->", len(nums), "tests")
         out.append(json.dumps({"commit": cid, "workers": ws}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 
